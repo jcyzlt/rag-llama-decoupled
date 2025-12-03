@@ -101,8 +101,16 @@ class LocalChunkScorer(nn.Module):
                     value=c_chunk,
                 )  # attn_w: [1,H,Q,Lc]
 
-                # 池化：mean over heads, query, tokens -> 标量
-                w = attn_w.mean(dim=1).mean(dim=1).mean(dim=1)  # [1]
+                # # 池化：mean over heads, query, tokens -> 标量
+                # w = attn_w.mean(dim=1).mean(dim=1).mean(dim=1)  # [1]
+                # scores_b.append(w.squeeze(0))
+
+                # AttentionRAG 风格池化：
+                # 1) 先对 token 做 max-pooling：max over Lc
+                # 2) 再对 head / query 做平均：mean over H, Q
+                # 得到一个标量分数
+                w = attn_w.max(dim=-1).values        # [1,H,Q]
+                w = w.mean(dim=1).mean(dim=1)        # [1]
                 scores_b.append(w.squeeze(0))
 
             scores_b = torch.stack(scores_b, dim=0)  # [J_b]
@@ -274,3 +282,4 @@ class MultiViewChunkRetrieval(nn.Module):
             "global_scores": global_scores,
             "global_gate": global_gate,
         }
+
