@@ -55,6 +55,15 @@ def preprocess_direction_a(input_path: str, output_path: str):
             "docs": docs,
             "doc_labels": doc_labels,
         })
+    pos_counts = []
+    for ex in out:
+        labs = ex["doc_labels"]
+        pos_counts.append(sum(labs))
+
+    print("样本总数:", len(pos_counts))
+    print("至少有1个正doc的比例:", sum(c > 0 for c in pos_counts) / len(pos_counts))
+    print("平均每个样本的正doc个数:", sum(pos_counts) / len(pos_counts))
+    print("pos_counts 前20个:", pos_counts[:20])    
 
     # 写入输出文件（如果需要保持JSON Lines格式，也可以逐行写入）
     with open(output_path, "w", encoding="utf-8") as f:
