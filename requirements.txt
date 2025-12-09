@@ -1,0 +1,7 @@
+python>=3.8
+numpy>=1.21.0
+torch>=1.13.0
+transformers>=4.28.0
+accelerate>=0.18.0
+tokenizers>=0.13.3
+jsonlines>=3.1.0

@@ -10,27 +10,30 @@ from transformers import AutoConfig, LlamaModel, LlamaPreTrainedModel
 from double_attention import DoubleAttentionStack  
 from multiview_chunk_retrieval import MultiViewChunkRetrieval
 
+import torch.nn.functional as F
 
 def compute_chunk_loss(
-    chunk_scores_list: List[torch.Tensor],
+    chunk_scores_list: List[torch.Tensor],  # logits
     chunk_labels_list: Optional[List[torch.Tensor]],
     device: torch.device,
 ) -> torch.Tensor:
-    """
-    简单版 chunk loss（方向 A 的逻辑）：
-    - chunk_scores_list: List[Tensor[J_b]]，已经 softmax 过
-    - chunk_labels_list: List[Tensor[J_b]]，0/1 标签
-    - 每条样本只有 1 个正样本时，退化为 -log p_pos
-    """
     if chunk_labels_list is None:
         return torch.tensor(0.0, device=device)
 
     losses = []
-    for scores_b, labels_b in zip(chunk_scores_list, chunk_labels_list):
+    for b_idx,(scores_b, labels_b) in enumerate(zip(chunk_scores_list, chunk_labels_list)):
         if scores_b is None or scores_b.numel() == 0:
             continue
-        scores_b = scores_b.to(device).float()
-        labels_b = labels_b.to(device).long()
+
+        # 1) 检查 NaN/Inf
+        if torch.isnan(scores_b).any() or torch.isinf(scores_b).any():
+            print("[NaN DEBUG] found NaN/Inf in chunk_scores, sample_idx =", b_idx)
+            print("  scores_b min/max:", scores_b.min().item(), scores_b.max().item())
+            # 这里可以选择直接跳过这个样本，避免训练崩盘
+            continue
+            
+        scores_b = scores_b.to(device).float()   # [J]
+        labels_b = labels_b.to(device).long()    # [J]
 
         J = scores_b.size(0)
         if labels_b.numel() > J:
@@ -40,16 +43,60 @@ def compute_chunk_loss(
             labels_b = torch.cat([labels_b, pad], dim=0)
 
         pos_mask = labels_b == 1
-        if pos_mask.sum() == 0:
+        num_pos = pos_mask.sum()
+        if num_pos == 0:
             continue
-        probs_pos = scores_b[pos_mask]
-        loss_b = -torch.log(probs_pos + 1e-8).mean()
+
+        # logits -> log_prob over chunks
+        log_prob = F.log_softmax(scores_b, dim=0)  # [J]
+
+        # 多正例：对所有正例 log p_pos 取平均
+        loss_b = -log_prob[pos_mask].mean()
         losses.append(loss_b)
 
     if not losses:
         return torch.tensor(0.0, device=device)
-
     return torch.stack(losses).mean()
+
+# def compute_chunk_loss(
+#     chunk_scores_list: List[torch.Tensor],
+#     chunk_labels_list: Optional[List[torch.Tensor]],
+#     device: torch.device,
+# ) -> torch.Tensor:
+#     """
+#     简单版 chunk loss（方向 A 的逻辑）：
+#     - chunk_scores_list: List[Tensor[J_b]]，已经 softmax 过
+#     - chunk_labels_list: List[Tensor[J_b]]，0/1 标签
+#     - 每条样本只有 1 个正样本时，退化为 -log p_pos
+#     """
+#     if chunk_labels_list is None:
+#         return torch.tensor(0.0, device=device)
+
+#     losses = []
+#     for scores_b, labels_b in zip(chunk_scores_list, chunk_labels_list):
+#         if scores_b is None or scores_b.numel() == 0:
+#             continue
+#         scores_b = scores_b.to(device).float()
+#         labels_b = labels_b.to(device).long()
+
+#         J = scores_b.size(0)
+#         if labels_b.numel() > J:
+#             labels_b = labels_b[:J]
+#         elif labels_b.numel() < J:
+#             pad = torch.zeros(J - labels_b.numel(), dtype=labels_b.dtype, device=device)
+#             labels_b = torch.cat([labels_b, pad], dim=0)
+
+#         pos_mask = labels_b == 1
+#         if pos_mask.sum() == 0:
+#             continue
+#         probs_pos = scores_b[pos_mask]
+#         loss_b = -torch.log(probs_pos + 1e-8).mean()
+#         losses.append(loss_b)
+
+#     if not losses:
+#         return torch.tensor(0.0, device=device)
+
+#     return torch.stack(losses).mean()
 
 
 class RAGLlamaDecoupled(LlamaPreTrainedModel):
@@ -67,9 +114,11 @@ class RAGLlamaDecoupled(LlamaPreTrainedModel):
         dropout: float = 0.1,
         prompt_max_len: int = 16,
         chunk_loss_weight: float = 0.1,
+        enable_global:bool = True,
     ):
         config = AutoConfig.from_pretrained(llama_model_name_or_path)
         super().__init__(config)
+        self.enable_global = enable_global
 
         # 1) LLaMA 主体（冻结）
         self.llama = LlamaModel.from_pretrained(
@@ -98,6 +147,7 @@ class RAGLlamaDecoupled(LlamaPreTrainedModel):
             hidden_size=self.hidden_size,
             num_heads=num_heads,
             dropout=dropout,
+            enable_global = enable_global,
         )
 
         # 4) 输出头：tie 到 embedding
@@ -310,6 +360,7 @@ class RAGLlamaDecoupled(LlamaPreTrainedModel):
         chunk_loss = compute_chunk_loss(final_scores, chunk_labels, device) * self.chunk_loss_weight
 
         total_loss = gen_loss + chunk_loss
+        # total_loss = chunk_loss
 
         return {
             "logits": logits,

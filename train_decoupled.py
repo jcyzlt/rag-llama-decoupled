@@ -17,6 +17,7 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from accelerate import Accelerator
 
+
 from rag_llama_decoupled import RAGLlamaDecoupled  # 你的新模型
 
 
@@ -36,17 +37,31 @@ def parse_args():
     parser.add_argument(
         "--llama_path",
         type=str,
-        default="/your/path/to/llama-2-7b",   # 换成你自己的
+        default="/media/hc-sfxz/4738C1D329F4278F/zlt/version6/TinyLlama-1.1B-Chat-v1.0",   # 换成你自己的
     )
     parser.add_argument(
         "--data_path",
         type=str,
-        default="./cleaned_train_direction_a.json",
+        default="/media/hc-sfxz/4738C1D329F4278F/zlt/version6/cleaned_data.jsonl",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
         default="./trained_decoupled",
+    )
+
+    parser.add_argument(
+        "--stage",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="1: 只用局部评估器训练(local-only)，2: 用local+global+router继续训练",
+    )
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help="stage=2 时，从 stage1 的输出目录加载模型",
     )
 
     # DoubleAttention 配置
@@ -56,7 +71,7 @@ def parse_args():
     parser.add_argument("--prompt_max_len", type=int, default=32)
 
     # 损失权重
-    parser.add_argument("--chunk_loss_weight", type=float, default=0.1)
+    parser.add_argument("--chunk_loss_weight", type=float, default=1.0)
 
     # 评估器选多少个 chunk
     parser.add_argument("--topk_chunks", type=int, default=4)
@@ -192,6 +207,15 @@ class RAGDecoupledDataset(Dataset):
 
         chunk_labels = torch.tensor(kept_labels, dtype=torch.long)  # [J_b]
 
+        # # Debug 模式（先临时这样写）
+        # J = len(chunk_spans)
+        # pseudo_labels = [0] * J
+        # if J > 0:
+        #     pseudo_labels[0] = 1   # 强行让第0个chunk是正例
+
+        # chunk_labels = torch.tensor(pseudo_labels, dtype=torch.long)
+        
+        
         # ---- 答案 ----
         a_ids = self.tokenizer(
             a_text,
@@ -267,18 +291,62 @@ def main():
     )
 
     # ---- model ----
-    model = RAGLlamaDecoupled(
-        llama_model_name_or_path=args.llama_path,
-        num_da_layers=args.da_layers,
-        num_heads=args.da_heads,
-        dropout=args.da_dropout,
-        prompt_max_len=args.prompt_max_len,
-        chunk_loss_weight=args.chunk_loss_weight,
-    )
+    # model = RAGLlamaDecoupled(
+    #     llama_model_name_or_path=args.llama_path,
+    #     num_da_layers=args.da_layers,
+    #     num_heads=args.da_heads,
+    #     dropout=args.da_dropout,
+    #     prompt_max_len=args.prompt_max_len,
+    #     chunk_loss_weight=args.chunk_loss_weight,
+    # )
+    # # tokenizer 加了 pad_token，需要 resize embedding / lm_head
+    # model.llama.resize_token_embeddings(len(tokenizer))
+    # model.resize_output_embeddings(len(tokenizer))
 
-    # tokenizer 加了 pad_token，需要 resize embedding / lm_head
-    model.llama.resize_token_embeddings(len(tokenizer))
-    model.resize_output_embeddings(len(tokenizer))
+     # ---- model ----
+    if args.stage == 1:
+        # Stage1：local-only 模式，从 LLaMA 权重初始化
+        model = RAGLlamaDecoupled(
+            llama_model_name_or_path=args.llama_path,
+            num_da_layers=args.da_layers,
+            num_heads=args.da_heads,
+            dropout=args.da_dropout,
+            prompt_max_len=args.prompt_max_len,
+            chunk_loss_weight=args.chunk_loss_weight,
+            enable_global=False,   # 核心：第一阶段禁用 global
+        )
+
+        model.llama.resize_token_embeddings(len(tokenizer))
+        model.resize_output_embeddings(len(tokenizer))
+
+    else:  # stage == 2
+        assert args.resume_from is not None, "stage=2 需要 --resume_from=stage1_model_dir"
+
+        # 从 stage1 的 checkpoint 加载（里面 local 已经训好，retrieval.enable_global=False）
+        model = RAGLlamaDecoupled.from_pretrained(
+            args.resume_from,
+            llama_model_name_or_path=args.llama_path,
+            num_da_layers=args.da_layers,
+            num_heads=args.da_heads,
+            dropout=args.da_dropout,
+            prompt_max_len=args.prompt_max_len,
+            chunk_loss_weight=args.chunk_loss_weight,
+            enable_global=True,   # 核心：第二阶段启用 global+router
+        )
+
+        # embedding resize 保持一致
+        model.llama.resize_token_embeddings(len(tokenizer))
+        model.resize_output_embeddings(len(tokenizer))
+        
+        for n, p in model.named_parameters():
+            if "retrieval.local_scorer" in n:
+                p.requires_grad = False       # 固定 local
+            elif "retrieval.global_scorer" in n:
+                p.requires_grad = True        # 训练 global
+            elif "retrieval.router" in n:
+                p.requires_grad = True        # 训练 router
+
+    
 
     model.llama.config.pad_token_id = tokenizer.pad_token_id
     model.llama.config.eos_token_id = tokenizer.eos_token_id
@@ -322,11 +390,14 @@ def main():
         sum_chunk = 0.0
         sum_total = 0.0
 
+        
+
         pbar = tqdm(
             dataloader,
             desc=f"Epoch {epoch + 1}/{args.epochs}",
             disable=not is_main,
         )
+        # pbar = tqdm(range(total_steps), disable=not accelerator.is_local_main_process)
 
         for step, batch in enumerate(pbar):
             optimizer.zero_grad(set_to_none=True)
@@ -355,8 +426,28 @@ def main():
                 gen_loss = out["gen_loss"]
                 chunk_loss = out["chunk_loss"]
 
+            #     final_scores = out["chunk_scores"]  # List[Tensor[J_b]]，按你的命名
+            #     fs0 = final_scores[0]
+
+            # print("fs0.requires_grad:", fs0.requires_grad)
+            # print("fs0.grad_fn:", fs0.grad_fn)
+
+
             total_loss = total_loss.float()
             accelerator.backward(total_loss)
+
+
+            
+            # # 看看 local_scorer 里权重的梯度是不是零
+            # gn_q = model.retrieval.local_scorer.self_attn.q_proj.weight.grad
+            # gn_k = model.retrieval.local_scorer.self_attn.k_proj.weight.grad
+            # gn_v = model.retrieval.local_scorer.self_attn.v_proj.weight.grad
+
+            # print("grad q_proj:", None if gn_q is None else gn_q.abs().mean().item())
+            # print("grad k_proj:", None if gn_k is None else gn_k.abs().mean().item())
+            # print("grad v_proj:", None if gn_v is None else gn_v.abs().mean().item())
+
+
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
