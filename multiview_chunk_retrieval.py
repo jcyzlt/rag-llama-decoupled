@@ -408,7 +408,7 @@ class GlobalChunkScorer(nn.Module):
         num_heads: int = 4,
         num_layers: int = 1,
         dropout: float = 0.1,
-        max_chunks: int = 32,
+        max_chunks: int = 10,
     ):
         super().__init__()
         self.local_feat_dim = local_feat_dim
@@ -633,7 +633,7 @@ class MultiViewChunkRetrieval(nn.Module):
             hidden_size=hidden_size,
             num_heads=num_heads,
             dropout=dropout,
-            num_layers=1,
+            num_layers=2,
             use_attn_feature=True,
         )
 

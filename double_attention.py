@@ -122,7 +122,7 @@ class StabilizedCrossAttention(nn.Module):
         return out, attn_weights, metrics
 
 
-# ========== 自注意力 ==========
+# ========== 自注意力 ==========使用因果掩码的（但是对于压缩器/融合器最好是非因果）
 class DiversifiedSelfAttention(nn.Module):
     """
     多样化自注意力
